@@ -288,6 +288,15 @@ try
 			else
 			{
 				info "No BD sub categories for user " + bdUserId + ": " + relResp;
+				// Diagnostics: show any category/service fields already on the BD user record
+				info "BD user record fields: " + u.keys();
+				for each  k in u.keys()
+				{
+					if(k.toLowerCase().contains("serv") || k.toLowerCase().contains("cat") || k.toLowerCase().contains("profession"))
+					{
+						info "BD user field " + k + " = " + u.get(k);
+					}
+				}
 			}
 			// Resolve service names + parents (pass 1: member's services, pass 2: their parents)
 			serviceCache = Map();
