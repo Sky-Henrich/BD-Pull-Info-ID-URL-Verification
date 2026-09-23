@@ -3,7 +3,8 @@
 // Argument mapping in the workflow: leadId -> Leads > Lead Id
 //
 // Looks up the lead's email on Brilliant Directories (igopanama.com) and
-// writes back BD_Member_ID, BD_Profile_URL, Verified_Member and Current_Plan.
+// writes back BD_Member_ID, BD_Profile_URL, Verified_Member, Current_Plan and
+// the category fields returned by standalone.bd_getCategoryFields.
 //
 // Every exit path logs an "info" line so failures show up in the
 // function's execution logs instead of failing silently.
@@ -190,6 +191,15 @@ try
 	else
 	{
 		updateMap.put("Verified_Member","NO - Not Verified");
+	}
+	// Top / Sub / Sub-sub categories (see function/bd_getCategoryFields)
+	catFields = standalone.bd_getCategoryFields(u.get("user_id").toString(),ifnull(u.get("profession_id"),"").toString(),ifnull(leadMap.get("Top_Category"),"").toString(),apiKey);
+	if(catFields != null)
+	{
+		for each  fieldName in catFields.keys()
+		{
+			updateMap.put(fieldName,catFields.get(fieldName));
+		}
 	}
 	updateResp = zoho.crm.updateRecord("Leads",leadId,updateMap);
 	info "Update sent: " + updateMap;
