@@ -1,1 +1,202 @@
-
+// automation.bd_lookupExistingProfile
+// Triggered by a Leads workflow rule (on create / import).
+// Argument mapping in the workflow: leadId -> Leads > Lead Id
+//
+// Looks up the lead's email on Brilliant Directories (igopanama.com) and
+// writes back BD_Member_ID, BD_Profile_URL, Verified_Member and Current_Plan.
+//
+// Every exit path logs an "info" line so failures show up in the
+// function's execution logs instead of failing silently.
+void automation.bd_lookupExistingProfile(Int leadId)
+{
+// Paste your BD API key here. Do not commit the real key to git.
+apiKey = "PASTE_BD_API_KEY_HERE";
+bdBase = "https://www.igopanama.com";
+headerMap = Map();
+headerMap.put("X-Api-Key",apiKey);
+leadMap = zoho.crm.getRecordById("Leads",leadId);
+if(leadMap == null || leadMap.get("id") == null)
+{
+	info "Lead " + leadId + " not found / not readable: " + leadMap;
+	return;
+}
+email = leadMap.get("Email");
+if(email == null || email.trim() == "")
+{
+	info "Lead " + leadId + " has no email - skipping";
+	return;
+}
+normalizedEmail = email.trim().toLowerCase();
+try
+{
+	u = null;
+	bdUserId = null;
+	// "get"    = direct lookup by email field (no HTML parsing)
+	// "search" = old method: search, scrape data-token, then user/get/{id}
+	for each  method in {"get","search"}
+	{
+		if(u == null)
+		{
+			rawMessage = null;
+			if(method == "get")
+			{
+				resp = invokeurl
+				[
+					url :bdBase + "/api/v2/user/get?property=email&property_value=" + encodeUrl(normalizedEmail)
+					type :GET
+					headers:headerMap
+					detailed:true
+				];
+			}
+			else
+			{
+				paramMap = Map();
+				paramMap.put("q",normalizedEmail);
+				searchResp = invokeurl
+				[
+					url :bdBase + "/api/v2/user/search"
+					type :POST
+					parameters:paramMap
+					headers:headerMap
+					detailed:true
+				];
+				searchText = searchResp.get("responseText").toString();
+				info "BD user/search -> HTTP " + searchResp.get("responseCode");
+				if(!searchText.startsWith("{"))
+				{
+					info "BD search returned non-JSON (firewall/Cloudflare block or API down?): " + searchText.left(500);
+					return;
+				}
+				searchBody = searchText.toMap();
+				if(searchBody.get("status") != "success" || searchBody.get("total_members").toString() == "0")
+				{
+					info "No BD member found for " + normalizedEmail + ". Response: " + searchText.left(500);
+					return;
+				}
+				htmlBlob = searchBody.get("message").toString();
+				tokenKey = "data-token=\"";
+				tokenStart = htmlBlob.indexOf(tokenKey);
+				if(tokenStart == -1)
+				{
+					info "Could not parse user_id from BD search HTML for " + normalizedEmail + ". HTML starts: " + htmlBlob.left(500);
+					return;
+				}
+				tokenStart = tokenStart + tokenKey.length();
+				tokenEnd = htmlBlob.indexOf("\"",tokenStart);
+				bdUserId = htmlBlob.subString(tokenStart,tokenEnd);
+				resp = invokeurl
+				[
+					url :bdBase + "/api/v2/user/get/" + bdUserId
+					type :GET
+					headers:headerMap
+					detailed:true
+				];
+			}
+			respCode = resp.get("responseCode");
+			respText = resp.get("responseText").toString();
+			info "BD user/get (" + method + ") -> HTTP " + respCode;
+			if(respCode == 401 || respCode == 403)
+			{
+				info "BD rejected the API key (HTTP " + respCode + "). Check the key is active and allowed to use user/get and user/search. Body: " + respText.left(500);
+				return;
+			}
+			if(respText.startsWith("{"))
+			{
+				respBody = respText.toMap();
+				if(respBody.get("status") == "success")
+				{
+					rawMessage = respBody.get("message");
+				}
+				else
+				{
+					info "BD user/get (" + method + ") not successful: " + respText.left(500);
+				}
+			}
+			else
+			{
+				info "BD user/get (" + method + ") returned non-JSON: " + respText.left(500);
+			}
+			// BD returns "message" as a list of users or a single user map
+			if(rawMessage != null)
+			{
+				rawMessage = rawMessage.toString();
+				candidates = List();
+				if(rawMessage.startsWith("["))
+				{
+					for each  item in rawMessage.toJSONList()
+					{
+						candidates.add(item.toString().toMap());
+					}
+				}
+				else if(rawMessage.startsWith("{"))
+				{
+					candidates.add(rawMessage.toMap());
+				}
+				for each  c in candidates
+				{
+					e = c.get("email");
+					if(u == null && e != null && e.toString().trim().toLowerCase() == normalizedEmail)
+					{
+						u = c;
+					}
+				}
+				if(u == null)
+				{
+					info "BD user/get (" + method + ") returned users but none with email " + normalizedEmail;
+				}
+			}
+		}
+	}
+	if(u == null)
+	{
+		info "No BD user matched " + normalizedEmail;
+		return;
+	}
+	updateMap = Map();
+	updateMap.put("BD_Member_ID",u.get("user_id").toString());
+	filenameVal = u.get("filename");
+	if(filenameVal != null && filenameVal.toString().trim() != "")
+	{
+		filenameVal = filenameVal.toString().trim();
+		if(filenameVal.startsWith("http"))
+		{
+			profileUrl = filenameVal;
+		}
+		else if(filenameVal.startsWith("/"))
+		{
+			profileUrl = bdBase + filenameVal;
+		}
+		else
+		{
+			profileUrl = bdBase + "/" + filenameVal;
+		}
+		updateMap.put("BD_Profile_URL",profileUrl);
+	}
+	planVal = null;
+	subSchema = u.get("subscription_schema");
+	if(subSchema != null && subSchema.toString().startsWith("{"))
+	{
+		planVal = subSchema.toString().toMap().get("subscription_name");
+	}
+	if(planVal != null && planVal.toString().trim() != "")
+	{
+		updateMap.put("Current_Plan",planVal.toString().trim());
+	}
+	verifiedVal = u.get("verified");
+	if(verifiedVal != null && verifiedVal.toString() == "1")
+	{
+		updateMap.put("Verified_Member","YES - Verified");
+	}
+	else
+	{
+		updateMap.put("Verified_Member","NO - Not Verified");
+	}
+	updateResp = zoho.crm.updateRecord("Leads",leadId,updateMap);
+	info "Update sent: " + updateMap;
+	info "CRM update response: " + updateResp;
+}
+catch (lookupError)
+{
+	info "BD lookup error for lead " + leadId + ": " + lookupError;
+}
+}
