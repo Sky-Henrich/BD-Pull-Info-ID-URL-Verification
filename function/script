@@ -193,9 +193,12 @@ try
 		updateMap.put("Verified_Member","NO - Not Verified");
 	}
 	// Top / Sub / Sub-sub categories (see function/bd_getCategoryFields)
-	catFields = standalone.bd_getCategoryFields(u.get("user_id").toString(),ifnull(u.get("profession_id"),"").toString(),ifnull(leadMap.get("Top_Category"),"").toString(),apiKey);
-	if(catFields != null)
+	// bd_getCategoryFields returns a JSON string, convert it back to a map
+	catFieldsText = standalone.bd_getCategoryFields(u.get("user_id").toString(),ifnull(u.get("profession_id"),"").toString(),ifnull(leadMap.get("Top_Category"),"").toString(),apiKey);
+	info "Category fields from bd_getCategoryFields: " + catFieldsText;
+	if(catFieldsText != null && catFieldsText.toString().startsWith("{"))
 	{
+		catFields = catFieldsText.toString().toMap();
 		for each  fieldName in catFields.keys()
 		{
 			updateMap.put(fieldName,catFields.get(fieldName));

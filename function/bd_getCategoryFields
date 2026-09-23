@@ -2,6 +2,7 @@
 // Create as a STANDALONE function (Setup > Developer Hub > Functions > New Function,
 // category "Standalone") named bd_getCategoryFields with these arguments:
 //   bdUserId (String), professionId (String), crmTopCategory (String), apiKey (String)
+// Return type: string (a JSON map of CRM fields; the caller converts it with toMap()).
 // Called from automation.bd_lookupExistingProfile.
 //
 // Reads the member's BD Top Category (list_professions), Sub / Sub-sub
@@ -12,7 +13,7 @@
 //            Sub_sub_category = children of "Tourism License (ATP Class)"
 //            Location_Setting / Key_Amenities / Good_For / Style_Vibe =
 //            children of the BD sub category with the same name
-map standalone.bd_getCategoryFields(String bdUserId, String professionId, String crmTopCategory, String apiKey)
+string standalone.bd_getCategoryFields(String bdUserId, String professionId, String crmTopCategory, String apiKey)
 {
 result = Map();
 bdBase = "https://www.igopanama.com";
@@ -64,7 +65,7 @@ try
 	if(pillar == "")
 	{
 		info "Top category is not one of the 5 pillars - skipping sub categories";
-		return result;
+		return result.toString();
 	}
 	if(crmTopCategory == null || crmTopCategory.trim() == "")
 	{
@@ -80,7 +81,7 @@ try
 	if(relResp.get("status") != "success")
 	{
 		info "No BD sub categories for user " + bdUserId + ": " + relResp;
-		return result;
+		return result.toString();
 	}
 	relMsg = relResp.get("message").toString();
 	relList = List();
@@ -104,7 +105,7 @@ try
 	memberServiceIds = toFetch;
 	// ---------- Resolve service names + parents (2 passes: services, then parents) ----------
 	serviceCache = Map();
-	for each  pass in {1,2}
+	for each  passNo in {1,2}
 	{
 		nextFetch = List();
 		for each  sid in toFetch
@@ -240,5 +241,5 @@ catch (catError)
 	info "BD category lookup error for user " + bdUserId + ": " + catError;
 }
 info "Category fields: " + result;
-return result;
+return result.toString();
 }
