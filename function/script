@@ -193,6 +193,10 @@ try
 		updateMap.put("Verified_Member","NO - Not Verified");
 	}
 	// ---------- Top / Sub / Sub-sub categories ----------
+	// Read from the BD user record itself (no extra API calls / permissions needed):
+	//   profession_schema = top category {"profession_id","name",...}
+	//   services_schema   = selected categories [{"service_id","name","master_id",...}]
+	//                       master_id "0" = sub category, otherwise = parent sub category's service_id
 	// Only for the 5 pillars:
 	//   Relocate, Stay, Live, Experience -> Sub_category, Sub_sub_category
 	//   Visit -> Sub_category = "Tourism License (ATP Class)"
@@ -202,8 +206,6 @@ try
 	// Wrapped in its own try so a category problem never blocks the ID/URL/verified update.
 	try 
 	{
-		bdUserId = u.get("user_id").toString();
-		professionId = ifnull(u.get("profession_id"),"").toString();
 		crmTopCategory = ifnull(leadMap.get("Top_Category"),"").toString().trim();
 		pillars = {"Visit","Relocate","Stay","Live","Experience"};
 		// BD Visit sub category name (lowercase) -> CRM field for its sub-sub categories
@@ -215,27 +217,10 @@ try
 		visitFieldMap.put("style & vibe","Style_Vibe");
 		// Top category (pillar) from BD, falling back to the CRM value
 		bdTop = "";
-		if(professionId != "" && professionId != "0")
+		profSchema = ifnull(u.get("profession_schema"),"").toString();
+		if(profSchema.startsWith("{"))
 		{
-			profResp = invokeurl
-			[
-				url :bdBase + "/api/v2/list_professions/get/" + professionId
-				type :GET
-				headers:headerMap
-			];
-			if(profResp.get("status") == "success")
-			{
-				profMsg = profResp.get("message").toString();
-				if(profMsg.startsWith("["))
-				{
-					profMsg = profMsg.toJSONList().get(0).toString();
-				}
-				bdTop = ifnull(profMsg.toMap().get("name"),"").toString().replaceAll("&amp;","&").trim();
-			}
-			else
-			{
-				info "BD list_professions/get/" + professionId + " failed: " + profResp;
-			}
+			bdTop = ifnull(profSchema.toMap().get("name"),"").toString().replaceAll("&amp;","&").trim();
 		}
 		pillar = "";
 		for each  p in pillars
@@ -256,122 +241,87 @@ try
 			{
 				updateMap.put("Top_Category",pillar);
 			}
-			// Member's selected categories (rel_services)
-			relResp = invokeurl
-			[
-				url :bdBase + "/api/v2/rel_services/get?property=user_id&property_value=" + bdUserId + "&limit=100"
-				type :GET
-				headers:headerMap
-			];
-			memberServiceIds = List();
-			if(relResp.get("status") == "success")
-			{
-				relMsg = relResp.get("message").toString();
-				relList = List();
-				if(relMsg.startsWith("["))
-				{
-					relList = relMsg.toJSONList();
-				}
-				else if(relMsg.startsWith("{"))
-				{
-					relList.add(relMsg);
-				}
-				for each  r in relList
-				{
-					sid = r.toString().toMap().get("service_id");
-					if(sid != null && !memberServiceIds.contains(sid.toString()))
-					{
-						memberServiceIds.add(sid.toString());
-					}
-				}
-			}
-			else
-			{
-				info "No BD sub categories for user " + bdUserId + ": " + relResp;
-				// Diagnostics: show any category/service fields already on the BD user record
-				info "BD user record fields: " + u.keys();
-				for each  k in u.keys()
-				{
-					if(k.toLowerCase().contains("serv") || k.toLowerCase().contains("cat") || k.toLowerCase().contains("profession"))
-					{
-						info "BD user field " + k + " = " + u.get(k);
-					}
-				}
-			}
-			// Resolve service names + parents (pass 1: member's services, pass 2: their parents)
+			// Parse services_schema into service_id -> {name, master_id}
 			serviceCache = Map();
-			toFetch = memberServiceIds;
-			for each  passNo in {1,2}
+			serviceOrder = List();
+			svcText = ifnull(u.get("services_schema"),"").toString().trim();
+			if(svcText.startsWith("{"))
 			{
-				nextFetch = List();
-				for each  sid in toFetch
+				// Deluge prints a list of maps without the surrounding brackets
+				svcText = "[" + svcText + "]";
+			}
+			if(svcText.startsWith("["))
+			{
+				for each  svcItem in svcText.toJSONList()
 				{
-					if(!serviceCache.containsKey(sid))
+					svc = svcItem.toString().toMap();
+					sid = ifnull(svc.get("service_id"),"").toString();
+					if(sid != "")
 					{
-						svcResp = invokeurl
-						[
-							url :bdBase + "/api/v2/list_services/get/" + sid
-							type :GET
-							headers:headerMap
-						];
-						if(svcResp.get("status") == "success")
+						masterId = ifnull(svc.get("master_id"),"0").toString();
+						if(masterId == "")
 						{
-							svcMsg = svcResp.get("message").toString();
-							if(svcMsg.startsWith("["))
-							{
-								svcMsg = svcMsg.toJSONList().get(0).toString();
-							}
-							svc = svcMsg.toMap();
-							svcName = ifnull(svc.get("name"),"").toString().replaceAll("&amp;","&").replaceAll("&#039;","'").trim();
-							masterId = ifnull(svc.get("master_id"),"0").toString();
-							if(masterId == "")
-							{
-								masterId = "0";
-							}
-							svcEntry = Map();
-							svcEntry.put("name",svcName);
-							svcEntry.put("master_id",masterId);
-							serviceCache.put(sid,svcEntry);
-							if(masterId != "0" && !serviceCache.containsKey(masterId) && !nextFetch.contains(masterId))
-							{
-								nextFetch.add(masterId);
-							}
+							masterId = "0";
 						}
-						else
-						{
-							info "BD list_services/get/" + sid + " failed: " + svcResp;
-						}
+						svcEntry = Map();
+						svcEntry.put("name",ifnull(svc.get("name"),"").toString().replaceAll("&amp;","&").replaceAll("&#039;","'").trim());
+						svcEntry.put("master_id",masterId);
+						serviceCache.put(sid,svcEntry);
+						serviceOrder.add(sid);
 					}
 				}
-				toFetch = nextFetch;
 			}
-			// Split into sub categories and sub-sub categories
 			subNames = List();
 			// each item: {"name": sub-sub name, "parent": parent sub name}
 			subSubs = List();
-			for each  sid in memberServiceIds
+			for each  sid in serviceOrder
 			{
-				if(serviceCache.containsKey(sid))
+				svcEntry = serviceCache.get(sid);
+				if(svcEntry.get("master_id") == "0")
 				{
-					svcEntry = serviceCache.get(sid);
-					if(svcEntry.get("master_id") == "0")
+					if(!subNames.contains(svcEntry.get("name")))
 					{
-						if(!subNames.contains(svcEntry.get("name")))
-						{
-							subNames.add(svcEntry.get("name"));
-						}
+						subNames.add(svcEntry.get("name"));
 					}
-					else
+				}
+				else
+				{
+					parentName = "";
+					if(serviceCache.containsKey(svcEntry.get("master_id")))
 					{
-						parentName = "";
-						if(serviceCache.containsKey(svcEntry.get("master_id")))
+						parentName = serviceCache.get(svcEntry.get("master_id")).get("name");
+					}
+					ss = Map();
+					ss.put("name",svcEntry.get("name"));
+					ss.put("parent",parentName);
+					subSubs.add(ss);
+				}
+			}
+			// Fallback: "services" text, e.g. "Home & Garden=>Pool Services,Home & Garden=>Solar Installation"
+			if(subNames.size() == 0 && subSubs.size() == 0)
+			{
+				servicesText = ifnull(u.get("services"),"").toString().trim();
+				if(servicesText != "")
+				{
+					for each  part in servicesText.toList(",")
+					{
+						part = part.trim();
+						if(part.contains("=>"))
 						{
-							parentName = serviceCache.get(svcEntry.get("master_id")).get("name");
+							parentName = part.getPrefix("=>").trim();
+							ss = Map();
+							ss.put("name",part.getSuffix("=>").trim());
+							ss.put("parent",parentName);
+							subSubs.add(ss);
+							if(!subNames.contains(parentName))
+							{
+								subNames.add(parentName);
+							}
 						}
-						ss = Map();
-						ss.put("name",svcEntry.get("name"));
-						ss.put("parent",parentName);
-						subSubs.add(ss);
+						else if(part != "" && !subNames.contains(part))
+						{
+							subNames.add(part);
+						}
 					}
 				}
 			}
