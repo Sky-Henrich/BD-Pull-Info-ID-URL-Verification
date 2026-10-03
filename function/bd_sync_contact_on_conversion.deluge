@@ -1,0 +1,301 @@
+/*
+ * BD Sync Contact On Conversion
+ * ---------------------------------------------------------------------------
+ * Purpose : When a Lead is converted, the new Contact triggers this function.
+ *           It finds the member in Brilliant Directories (igopanama.com) and
+ *           updates, with BD as the source of truth:
+ *             - the Contact
+ *             - the Contact's Account
+ *             - every Deal linked to the Contact
+ *           Lead_Source is NEVER updated.
+ *
+ * Setup in Zoho CRM:
+ *   1. Org variable  bd_api_key  = BD API key (Developer Hub > Variables)
+ *   2. Setup > Automation > Workflow Rules > Contacts > Create Rule
+ *        Name     : BD Sync Contact on Conversion
+ *        When     : Record action > Create
+ *        Condition: All Contacts
+ *        Action   : Function > bd_sync_contact_on_conversion
+ *        Argument : contactId (string) -> Contacts - Contact Id
+ *   3. Deactivate the old "BD Sync Deal on Conversion" rule on Deals.
+ *
+ * BD member lookup order:
+ *   1. BD_Member_ID on the Contact, Account or a linked Deal
+ *   2. Member ID inside BD_Profile_URL on any of them (.../12207/name)
+ *   3. Contact Email, then Secondary Email
+ *   4. Account name = BD company (only when exactly one member matches)
+ * ---------------------------------------------------------------------------
+ */
+void automation.bd_sync_contact_on_conversion(String contactId)
+{
+	bdBaseUrl = "https://www.igopanama.com";
+	apiKey = zoho.crm.getOrgVariable("bd_api_key");
+	headers = Map();
+	headers.put("X-Api-Key",apiKey);
+	pillarList = {"Community","Stay","Live","Experience","Relocate","Visit"};
+	fillOnlyFields = {"Top_Category","Subscription_Start_Date"};
+	// CRM field -> BD value key, per module
+	contactFields = {"BD_Member_ID":"id","BD_Profile_URL":"url","Verified_Member":"verified","First_Name":"first","Last_Name":"last","Email":"email","Phone":"phone","Mailing_City":"city","Top_Category":"pillar"};
+	accountFields = {"BD_Member_ID":"id","BD_Profile_URL":"url","Verified_Member":"verified","Account_Name":"company","Phone":"phone","Website":"website","Billing_City":"city","Top_Category":"pillar"};
+	dealFields = {"BD_Member_ID":"id","BD_Profile_URL":"url","Current_Plan":"plan","Verified_Member":"verified","Subscription_Start_Date":"startDate","Top_Category":"pillar"};
+	//
+	// ---------- 1. Load Contact, Account and Deals ----------
+	contact = zoho.crm.getRecordById("Contacts",contactId.toLong());
+	if(contact == null || contact.get("id") == null)
+	{
+		info "Contact " + contactId + " not found";
+		return;
+	}
+	account = Map();
+	if(contact.get("Account_Name") != null)
+	{
+		account = zoho.crm.getRecordById("Accounts",contact.get("Account_Name").get("id").toLong());
+	}
+	deals = zoho.crm.getRelatedRecords("Deals","Contacts",contactId.toLong());
+	if(deals == null)
+	{
+		deals = List();
+	}
+	info "Contact " + contactId + ": account " + account.get("id") + ", deals " + deals.size();
+	//
+	// ---------- 2. Collect lookup keys ----------
+	sources = List();
+	sources.add(contact);
+	if(account.get("id") != null)
+	{
+		sources.add(account);
+	}
+	for each d in deals
+	{
+		sources.add(d);
+	}
+	candidateIds = List();
+	for each src in sources
+	{
+		sid = ifnull(src.get("BD_Member_ID"),"").toString().trim();
+		if(sid != "" && !candidateIds.contains(sid))
+		{
+			candidateIds.add(sid);
+		}
+	}
+	for each src in sources
+	{
+		surl = ifnull(src.get("BD_Profile_URL"),"").toString().trim();
+		if(surl.contains("igopanama.com/"))
+		{
+			urlId = ifnull(surl.getSuffix("igopanama.com/"),"");
+			if(urlId.contains("/"))
+			{
+				urlId = urlId.getPrefix("/");
+			}
+			if(urlId.isNumber() && !candidateIds.contains(urlId))
+			{
+				candidateIds.add(urlId);
+			}
+		}
+	}
+	//
+	// ---------- 3. Find the member in BD ----------
+	bdUser = Map();
+	matchedBy = "";
+	for each cid in candidateIds
+	{
+		if(bdUser.isEmpty())
+		{
+			resp = invokeurl
+			[
+				url :bdBaseUrl + "/api/v2/user/get?property=user_id&property_value=" + encodeUrl(cid)
+				type :GET
+				headers:headers
+			];
+			info "BD lookup by user_id " + cid + ": " + resp;
+			if(resp.get("status") == "success" && resp.get("message") != null && resp.get("message").size() > 0)
+			{
+				bdUser = resp.get("message").get(0);
+				matchedBy = "member ID " + cid;
+			}
+		}
+	}
+	emails = List();
+	emails.add(ifnull(contact.get("Email"),"").toString().trim());
+	emails.add(ifnull(contact.get("Secondary_Email"),"").toString().trim());
+	for each em in emails
+	{
+		if(bdUser.isEmpty() && em != "")
+		{
+			resp = invokeurl
+			[
+				url :bdBaseUrl + "/api/v2/user/get?property=email&property_value=" + encodeUrl(em)
+				type :GET
+				headers:headers
+			];
+			info "BD lookup by email " + em + ": " + resp;
+			if(resp.get("status") == "success" && resp.get("message") != null && resp.get("message").size() > 0)
+			{
+				bdUser = resp.get("message").get(0);
+				matchedBy = "email " + em;
+			}
+		}
+	}
+	companyName = ifnull(account.get("Account_Name"),"").toString().trim();
+	if(bdUser.isEmpty() && companyName.length() >= 3)
+	{
+		resp = invokeurl
+		[
+			url :bdBaseUrl + "/api/v2/user/get?property=company&property_value=" + encodeUrl(companyName)
+			type :GET
+			headers:headers
+		];
+		info "BD lookup by company " + companyName + ": " + resp;
+		// only trust a company match when it is unique
+		if(resp.get("status") == "success" && resp.get("message") != null && resp.get("message").size() == 1)
+		{
+			bdUser = resp.get("message").get(0);
+			matchedBy = "company " + companyName;
+		}
+	}
+	if(bdUser.isEmpty())
+	{
+		info "No BD member found for Contact " + contactId + " (ids " + candidateIds + ", emails " + emails + ", company '" + companyName + "')";
+		return;
+	}
+	//
+	// ---------- 4. Normalise BD values ----------
+	v = Map();
+	v.put("id",ifnull(bdUser.get("user_id"),"").toString().trim());
+	filename = ifnull(bdUser.get("filename"),"").toString().trim();
+	if(filename.startsWith("/"))
+	{
+		filename = filename.subString(1);
+	}
+	profileUrl = "";
+	if(filename != "")
+	{
+		profileUrl = bdBaseUrl + "/" + filename;
+	}
+	v.put("url",profileUrl);
+	planName = "";
+	schema = bdUser.get("subscription_schema");
+	if(schema != null && schema.get("subscription_name") != null)
+	{
+		planName = schema.get("subscription_name").toString().trim();
+	}
+	subscriptionId = ifnull(bdUser.get("subscription_id"),"").toString();
+	if(planName == "" && subscriptionId != "")
+	{
+		planResp = invokeurl
+		[
+			url :bdBaseUrl + "/api/v2/subscription_types/get?property=subscription_id&property_value=" + encodeUrl(subscriptionId)
+			type :GET
+			headers:headers
+		];
+		info "BD plan lookup " + subscriptionId + ": " + planResp;
+		if(planResp.get("status") == "success" && planResp.get("message") != null && planResp.get("message").size() > 0)
+		{
+			planName = ifnull(planResp.get("message").get(0).get("subscription_name"),"").toString().trim();
+		}
+	}
+	v.put("plan",planName);
+	pillar = ifnull(planName.getPrefix(" "),"");
+	if(!pillarList.contains(pillar))
+	{
+		pillar = "";
+	}
+	v.put("pillar",pillar);
+	v.put("first",ifnull(bdUser.get("first_name"),"").toString().trim());
+	v.put("last",ifnull(bdUser.get("last_name"),"").toString().trim());
+	v.put("email",ifnull(bdUser.get("email"),"").toString().trim());
+	v.put("phone",ifnull(bdUser.get("phone_number"),"").toString().trim());
+	v.put("company",ifnull(bdUser.get("company"),"").toString().trim());
+	v.put("website",ifnull(bdUser.get("website"),"").toString().trim());
+	v.put("city",ifnull(bdUser.get("city"),"").toString().trim());
+	verified = "";
+	if(bdUser.get("verified") != null)
+	{
+		verified = "NO - Not Verified";
+		if(bdUser.get("verified").toString() == "1")
+		{
+			verified = "YES - Verified";
+		}
+	}
+	v.put("verified",verified);
+	signupDigits = ifnull(bdUser.get("signup_date"),"").toString().replaceAll("[^0-9]","");
+	startDate = "";
+	if(signupDigits.length() >= 8)
+	{
+		startDate = signupDigits.subString(0,4) + "-" + signupDigits.subString(4,6) + "-" + signupDigits.subString(6,8);
+	}
+	v.put("startDate",startDate);
+	info "Matched BD member " + v.get("id") + " by " + matchedBy + ": " + v;
+	//
+	// ---------- 5. Update Contact, Account and Deals ----------
+	targets = List();
+	t = Map();
+	t.put("module","Contacts");
+	t.put("record",contact);
+	t.put("fields",contactFields);
+	targets.add(t);
+	if(account.get("id") != null)
+	{
+		t = Map();
+		t.put("module","Accounts");
+		t.put("record",account);
+		t.put("fields",accountFields);
+		targets.add(t);
+	}
+	for each d in deals
+	{
+		t = Map();
+		t.put("module","Deals");
+		t.put("record",d);
+		t.put("fields",dealFields);
+		targets.add(t);
+	}
+	for each t in targets
+	{
+		moduleName = t.get("module");
+		rec = t.get("record");
+		fieldMap = t.get("fields");
+		update = Map();
+		for each crmField in fieldMap.keys()
+		{
+			newVal = ifnull(v.get(fieldMap.get(crmField)),"");
+			if(newVal != "" && crmField != "Lead_Source")
+			{
+				curStr = ifnull(rec.get(crmField),"").toString().trim();
+				same = curStr.toLowerCase() == newVal.toLowerCase();
+				if(crmField == "Phone")
+				{
+					same = curStr.replaceAll("[^0-9]","") == newVal.replaceAll("[^0-9]","");
+				}
+				if(crmField == "Website" || crmField == "BD_Profile_URL")
+				{
+					same = curStr.toLowerCase().removeLastOccurence("/") == newVal.toLowerCase().removeLastOccurence("/") || same;
+				}
+				fillOnlyBlocked = fillOnlyFields.contains(crmField) && curStr != "";
+				if(!same && !fillOnlyBlocked)
+				{
+					update.put(crmField,newVal);
+				}
+			}
+		}
+		// keep the old Contact email when BD replaces it
+		if(moduleName == "Contacts" && update.containKey("Email"))
+		{
+			oldEmail = ifnull(rec.get("Email"),"").toString().trim();
+			if(oldEmail != "" && ifnull(rec.get("Secondary_Email"),"").toString().trim() == "")
+			{
+				update.put("Secondary_Email",oldEmail);
+			}
+		}
+		if(update.size() > 0)
+		{
+			res = zoho.crm.updateRecord(moduleName,rec.get("id").toLong(),update);
+			info moduleName + " " + rec.get("id") + " updated: " + update + " -> " + res;
+		}
+		else
+		{
+			info moduleName + " " + rec.get("id") + " already in sync";
+		}
+	}
+}
