@@ -1,0 +1,157 @@
+/*
+ * BD Sync Deal On Conversion
+ * ---------------------------------------------------------------------------
+ * Purpose : When a Lead is converted into a Deal, call Brilliant Directories
+ *           (igopanama.com) to fetch the member's live data (current plan,
+ *           member ID, profile URL, signup date) and write it back to the Deal.
+ *           If the member already exists in BD, the Deal is updated with the
+ *           existing BD record instead of being left blank.
+ *
+ * Setup in Zoho CRM:
+ *   1. Setup > Developer Hub > Functions > New Function
+ *        Name     : bd_sync_deal_on_conversion
+ *        Category : Automation
+ *        Argument : dealId (string)  -> map to Deals > Deal Id
+ *   2. Setup > Developer Hub > Variables: create org variable
+ *        API name : bd_api_key       -> your BD API key (Developer Hub in BD admin)
+ *   3. Setup > Automation > Workflow Rules > Deals
+ *        When     : On Record Action > Create
+ *        Condition: All Deals (or Lead Source / Top Category as needed)
+ *        Action   : Function > bd_sync_deal_on_conversion
+ *      Deals created by lead conversion fire the Deals "Create" workflow.
+ *
+ * Lookup order in BD:
+ *   1. Deal.BD_Member_ID (mapped from the Lead during conversion)
+ *   2. Contact email (fallback when the Lead had no member ID)
+ * ---------------------------------------------------------------------------
+ */
+void automation.bd_sync_deal_on_conversion(String dealId)
+{
+	bdBaseUrl = "https://www.igopanama.com";
+	apiKey = zoho.crm.getOrgVariable("bd_api_key");
+	headers = Map();
+	headers.put("X-Api-Key",apiKey);
+	//
+	// ---------- 1. Load the Deal ----------
+	deal = zoho.crm.getRecordById("Deals",dealId.toLong());
+	if(deal == null || deal.get("id") == null)
+	{
+		info "Deal " + dealId + " not found";
+		return;
+	}
+	memberId = ifnull(deal.get("BD_Member_ID"),"").trim();
+	contactEmail = "";
+	if(deal.get("Contact_Name") != null)
+	{
+		contact = zoho.crm.getRecordById("Contacts",deal.get("Contact_Name").get("id").toLong());
+		contactEmail = ifnull(contact.get("Email"),"").trim();
+	}
+	//
+	// ---------- 2. Fetch the member from BD ----------
+	bdUser = Map();
+	if(memberId != "")
+	{
+		resp = invokeurl
+		[
+			url :bdBaseUrl + "/api/v2/user/get?property=user_id&property_value=" + encodeUrl(memberId)
+			type :GET
+			headers:headers
+		];
+		info "BD lookup by user_id " + memberId + ": " + resp;
+		if(resp.get("status") == "success" && resp.get("message") != null && resp.get("message").size() > 0)
+		{
+			bdUser = resp.get("message").get(0);
+		}
+	}
+	if(bdUser.isEmpty() && contactEmail != "")
+	{
+		resp = invokeurl
+		[
+			url :bdBaseUrl + "/api/v2/user/get?property=email&property_value=" + encodeUrl(contactEmail)
+			type :GET
+			headers:headers
+		];
+		info "BD lookup by email " + contactEmail + ": " + resp;
+		if(resp.get("status") == "success" && resp.get("message") != null && resp.get("message").size() > 0)
+		{
+			bdUser = resp.get("message").get(0);
+		}
+	}
+	if(bdUser.isEmpty())
+	{
+		info "No BD member found for Deal " + dealId + " (member ID '" + memberId + "', email '" + contactEmail + "')";
+		return;
+	}
+	//
+	// ---------- 3. Resolve the current plan name ----------
+	planName = "";
+	schema = bdUser.get("subscription_schema");
+	if(schema != null && schema.get("subscription_name") != null)
+	{
+		planName = schema.get("subscription_name").trim();
+	}
+	subscriptionId = ifnull(bdUser.get("subscription_id"),"").toString();
+	if(planName == "" && subscriptionId != "")
+	{
+		planResp = invokeurl
+		[
+			url :bdBaseUrl + "/api/v2/subscription_types/get?property=subscription_id&property_value=" + encodeUrl(subscriptionId)
+			type :GET
+			headers:headers
+		];
+		info "BD plan lookup " + subscriptionId + ": " + planResp;
+		if(planResp.get("status") == "success" && planResp.get("message") != null && planResp.get("message").size() > 0)
+		{
+			planName = ifnull(planResp.get("message").get(0).get("subscription_name"),"").trim();
+		}
+	}
+	//
+	// ---------- 4. Build the Deal update ----------
+	update = Map();
+	bdUserId = ifnull(bdUser.get("user_id"),"").toString();
+	if(bdUserId != "" && bdUserId != memberId)
+	{
+		update.put("BD_Member_ID",bdUserId);
+	}
+	filename = ifnull(bdUser.get("filename"),"").toString().trim();
+	if(filename != "")
+	{
+		if(filename.startsWith("/"))
+		{
+			filename = filename.subString(1);
+		}
+		profileUrl = bdBaseUrl + "/" + filename;
+		if(profileUrl != ifnull(deal.get("BD_Profile_URL"),""))
+		{
+			update.put("BD_Profile_URL",profileUrl);
+		}
+	}
+	if(planName != "" && planName != ifnull(deal.get("Current_Plan"),""))
+	{
+		update.put("Current_Plan",planName);
+	}
+	// Top Category = first word of the plan when it is one of the pillars (e.g. "Experience Listing" -> Experience)
+	if(planName != "" && deal.get("Top_Category") == null)
+	{
+		pillar = planName.getPrefix(" ");
+		if(pillar != null && {"Community","Stay","Live","Experience","Relocate","Visit"}.contains(pillar))
+		{
+			update.put("Top_Category",pillar);
+		}
+	}
+	// BD signup_date comes as YYYYMMDDHHMMSS; only fill if the Deal has no start date yet
+	signup = ifnull(bdUser.get("signup_date"),"").toString();
+	if(deal.get("Subscription_Start_Date") == null && signup.length() >= 8 && signup.subString(0,8).isNumber())
+	{
+		update.put("Subscription_Start_Date",signup.subString(0,4) + "-" + signup.subString(4,6) + "-" + signup.subString(6,8));
+	}
+	//
+	// ---------- 5. Write back ----------
+	if(update.isEmpty())
+	{
+		info "Deal " + dealId + " already in sync with BD member " + bdUserId;
+		return;
+	}
+	result = zoho.crm.updateRecord("Deals",dealId.toLong(),update);
+	info "Deal " + dealId + " updated from BD member " + bdUserId + ": " + update + " -> " + result;
+}
