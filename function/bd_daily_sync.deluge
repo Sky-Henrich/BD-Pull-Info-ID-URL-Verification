@@ -67,7 +67,12 @@ void schedule.bd_daily_sync()
 	// Company values too generic to match on
 	ignoreCompanies = {"independiente","indepediente","independent","self-employed","autonomo","autónomo","personal","no","n/a","na","none","panama","panamá","test","."};
 	// ========================================================
-	apiKey = zoho.crm.getOrgVariable("bd_api_key");
+	apiKey = ifnull(zoho.crm.getOrgVariable("bd_api_key"),"").toString().trim();
+	if(apiKey == "")
+	{
+		info "STOPPED: org variable bd_api_key is empty or missing";
+		return;
+	}
 	headers = Map();
 	headers.put("X-Api-Key",apiKey);
 	//

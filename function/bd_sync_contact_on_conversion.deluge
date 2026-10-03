@@ -22,14 +22,21 @@
  * BD member lookup order:
  *   1. BD_Member_ID on the Contact, Account or a linked Deal
  *   2. Member ID inside BD_Profile_URL on any of them (.../12207/name)
+ *   Fallbacks when there is no BD Member ID (or it is not found in BD):
  *   3. Contact Email, then Secondary Email
- *   4. Account name = BD company (only when exactly one member matches)
+ *   4. Account name = BD company
+ *   5. Contact Phone / Mobile (tried as-is, digits only, +digits, without 507)
  * ---------------------------------------------------------------------------
  */
 void automation.bd_sync_contact_on_conversion(String contactId)
 {
 	bdBaseUrl = "https://www.igopanama.com";
-	apiKey = zoho.crm.getOrgVariable("bd_api_key");
+	apiKey = ifnull(zoho.crm.getOrgVariable("bd_api_key"),"").toString().trim();
+	if(apiKey == "")
+	{
+		info "STOPPED: org variable bd_api_key is empty or missing";
+		return;
+	}
 	headers = Map();
 	headers.put("X-Api-Key",apiKey);
 	pillarList = {"Community","Stay","Live","Experience","Relocate","Visit"};
@@ -96,67 +103,110 @@ void automation.bd_sync_contact_on_conversion(String contactId)
 	}
 	//
 	// ---------- 3. Find the member in BD ----------
-	bdUser = Map();
-	matchedBy = "";
+	// Each lookup = property|value|label. Tried in order until one matches.
+	lookups = List();
 	for each cid in candidateIds
 	{
-		if(bdUser.isEmpty())
-		{
-			resp = invokeurl
-			[
-				url :bdBaseUrl + "/api/v2/user/get?property=user_id&property_value=" + encodeUrl(cid)
-				type :GET
-				headers:headers
-			];
-			info "BD lookup by user_id " + cid + ": " + resp;
-			if(resp.get("status") == "success" && resp.get("message") != null && resp.get("message").size() > 0)
-			{
-				bdUser = resp.get("message").get(0);
-				matchedBy = "member ID " + cid;
-			}
-		}
+		lk = Map();
+		lk.put("property","user_id");
+		lk.put("value",cid);
+		lk.put("label","member ID");
+		lookups.add(lk);
 	}
-	emails = List();
-	emails.add(ifnull(contact.get("Email"),"").toString().trim());
-	emails.add(ifnull(contact.get("Secondary_Email"),"").toString().trim());
-	for each em in emails
+	// Fallbacks when there is no (valid) BD Member ID: 1. Email  2. Company  3. Phone
+	emailFields = {"Email","Secondary_Email"};
+	for each emField in emailFields
 	{
-		if(bdUser.isEmpty() && em != "")
+		em = ifnull(contact.get(emField),"").toString().trim();
+		if(em != "")
 		{
-			resp = invokeurl
-			[
-				url :bdBaseUrl + "/api/v2/user/get?property=email&property_value=" + encodeUrl(em)
-				type :GET
-				headers:headers
-			];
-			info "BD lookup by email " + em + ": " + resp;
-			if(resp.get("status") == "success" && resp.get("message") != null && resp.get("message").size() > 0)
-			{
-				bdUser = resp.get("message").get(0);
-				matchedBy = "email " + em;
-			}
+			lk = Map();
+			lk.put("property","email");
+			lk.put("value",em);
+			lk.put("label","email");
+			lookups.add(lk);
 		}
 	}
 	companyName = ifnull(account.get("Account_Name"),"").toString().trim();
-	if(bdUser.isEmpty() && companyName.length() >= 3)
+	if(companyName.length() >= 3)
 	{
-		resp = invokeurl
-		[
-			url :bdBaseUrl + "/api/v2/user/get?property=company&property_value=" + encodeUrl(companyName)
-			type :GET
-			headers:headers
-		];
-		info "BD lookup by company " + companyName + ": " + resp;
-		// only trust a company match when it is unique
-		if(resp.get("status") == "success" && resp.get("message") != null && resp.get("message").size() == 1)
+		lk = Map();
+		lk.put("property","company");
+		lk.put("value",companyName);
+		lk.put("label","company");
+		lookups.add(lk);
+	}
+	// BD may store the phone with or without +507 / formatting, so try a few variants
+	phoneVariants = List();
+	phoneFields = {"Phone","Mobile"};
+	for each phField in phoneFields
+	{
+		raw = ifnull(contact.get(phField),"").toString().trim();
+		digits = raw.replaceAll("[^0-9]","");
+		if(digits.length() >= 7)
 		{
-			bdUser = resp.get("message").get(0);
-			matchedBy = "company " + companyName;
+			candidates = List();
+			candidates.add(raw);
+			candidates.add(digits);
+			candidates.add("+" + digits);
+			if(digits.startsWith("507") && digits.length() > 8)
+			{
+				candidates.add(digits.subString(3));
+			}
+			for each pv in candidates
+			{
+				if(!phoneVariants.contains(pv))
+				{
+					phoneVariants.add(pv);
+				}
+			}
 		}
+	}
+	for each pv in phoneVariants
+	{
+		lk = Map();
+		lk.put("property","phone_number");
+		lk.put("value",pv);
+		lk.put("label","phone");
+		lookups.add(lk);
+	}
+	bdUser = Map();
+	matchedBy = "";
+	keyRejected = false;
+	for each lookup in lookups
+	{
+		if(bdUser.isEmpty() && !keyRejected)
+		{
+			resp = invokeurl
+			[
+				url :bdBaseUrl + "/api/v2/user/get?property=" + lookup.get("property") + "&property_value=" + encodeUrl(lookup.get("value"))
+				type :GET
+				headers:headers
+			];
+			info "BD lookup by " + lookup.get("label") + " '" + lookup.get("value") + "': " + resp;
+			if(resp.get("status") == "success" && resp.get("message") != null && resp.get("message").size() > 0)
+			{
+				bdUser = resp.get("message").get(0);
+				matchedBy = lookup.get("label") + " " + lookup.get("value");
+				if(resp.get("message").size() > 1)
+				{
+					info "Note: " + resp.get("message").size() + " BD members share this " + lookup.get("label") + "; using the first one (ID " + bdUser.get("user_id") + ")";
+				}
+			}
+			else if(ifnull(resp.get("message"),"").toString().containsIgnoreCase("API Key"))
+			{
+				keyRejected = true;
+			}
+		}
+	}
+	if(keyRejected)
+	{
+		info "STOPPED: BD rejected the API key. Check org variable bd_api_key (value, no spaces) and the key's permissions in BD Admin > Developer Hub > API Keys.";
+		return;
 	}
 	if(bdUser.isEmpty())
 	{
-		info "No BD member found for Contact " + contactId + " (ids " + candidateIds + ", emails " + emails + ", company '" + companyName + "')";
+		info "No BD member found for Contact " + contactId + " (tried " + lookups.size() + " lookups: member ID, email, company, phone)";
 		return;
 	}
 	//
