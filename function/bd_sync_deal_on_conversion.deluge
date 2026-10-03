@@ -133,8 +133,9 @@ void automation.bd_sync_deal_on_conversion(String dealId)
 	// Top Category = first word of the plan when it is one of the pillars (e.g. "Experience Listing" -> Experience)
 	if(planName != "" && deal.get("Top_Category") == null)
 	{
-		pillar = planName.getPrefix(" ");
-		if(pillar != null && {"Community","Stay","Live","Experience","Relocate","Visit"}.contains(pillar))
+		pillarList = {"Community","Stay","Live","Experience","Relocate","Visit"};
+		pillar = ifnull(planName.getPrefix(" "),"");
+		if(pillar != "" && pillarList.contains(pillar))
 		{
 			update.put("Top_Category",pillar);
 		}

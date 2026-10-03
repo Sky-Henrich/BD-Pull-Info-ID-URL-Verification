@@ -53,10 +53,14 @@ void schedule.bd_daily_sync()
 	maxBdSingleCalls = 40;
 	modules = {"Accounts","Contacts","Deals","Leads"};
 	moduleFields = Map();
-	moduleFields.put("Leads",{"BD_Member_ID":"id","BD_Profile_URL":"url","Current_Plan":"plan","Verified_Member":"verified","First_Name":"first","Last_Name":"last","Email":"email","Phone":"phone","Company":"company","Website":"website","City":"city","Top_Category":"pillar"});
-	moduleFields.put("Contacts",{"BD_Member_ID":"id","BD_Profile_URL":"url","Verified_Member":"verified","First_Name":"first","Last_Name":"last","Email":"email","Phone":"phone","Mailing_City":"city","Top_Category":"pillar"});
-	moduleFields.put("Accounts",{"BD_Member_ID":"id","BD_Profile_URL":"url","Verified_Member":"verified","Account_Name":"company","Phone":"phone","Website":"website","Billing_City":"city","Top_Category":"pillar"});
-	moduleFields.put("Deals",{"BD_Member_ID":"id","BD_Profile_URL":"url","Current_Plan":"plan","Verified_Member":"verified","Subscription_Start_Date":"startDate","Top_Category":"pillar"});
+	fieldsLeads = {"BD_Member_ID":"id","BD_Profile_URL":"url","Current_Plan":"plan","Verified_Member":"verified","First_Name":"first","Last_Name":"last","Email":"email","Phone":"phone","Company":"company","Website":"website","City":"city","Top_Category":"pillar"};
+	moduleFields.put("Leads",fieldsLeads);
+	fieldsContacts = {"BD_Member_ID":"id","BD_Profile_URL":"url","Verified_Member":"verified","First_Name":"first","Last_Name":"last","Email":"email","Phone":"phone","Mailing_City":"city","Top_Category":"pillar"};
+	moduleFields.put("Contacts",fieldsContacts);
+	fieldsAccounts = {"BD_Member_ID":"id","BD_Profile_URL":"url","Verified_Member":"verified","Account_Name":"company","Phone":"phone","Website":"website","Billing_City":"city","Top_Category":"pillar"};
+	moduleFields.put("Accounts",fieldsAccounts);
+	fieldsDeals = {"BD_Member_ID":"id","BD_Profile_URL":"url","Current_Plan":"plan","Verified_Member":"verified","Subscription_Start_Date":"startDate","Top_Category":"pillar"};
+	moduleFields.put("Deals",fieldsDeals);
 	fillOnlyFields = {"Top_Category","Subscription_Start_Date"};
 	neverUpdate = {"Lead_Source"};
 	pillars = {"Community","Stay","Live","Experience","Relocate","Visit"};
@@ -114,13 +118,27 @@ void schedule.bd_daily_sync()
 				if(em != "")
 				{
 					prev = byEmail.get(em);
-					byEmail.put(em,if(prev == null || prev == uid,uid,"DUP"));
+					if(prev == null || prev == uid)
+					{
+						byEmail.put(em,uid);
+					}
+					else
+					{
+						byEmail.put(em,"DUP");
+					}
 				}
 				co = ifnull(u.get("company"),"").toString().trim().toLowerCase().replaceAll("\\s+"," ");
 				if(co.length() >= 3 && !ignoreCompanies.contains(co))
 				{
 					prev = byCompany.get(co);
-					byCompany.put(co,if(prev == null || prev == uid,uid,"DUP"));
+					if(prev == null || prev == uid)
+					{
+						byCompany.put(co,uid);
+					}
+					else
+					{
+						byCompany.put(co,"DUP");
+					}
 				}
 				fnm = ifnull(u.get("first_name"),"").toString().trim().toLowerCase();
 				lnm = ifnull(u.get("last_name"),"").toString().trim().toLowerCase();
@@ -128,7 +146,14 @@ void schedule.bd_daily_sync()
 				{
 					nm = (fnm + " " + lnm).replaceAll("\\s+"," ");
 					prev = byName.get(nm);
-					byName.put(nm,if(prev == null || prev == uid,uid,"DUP"));
+					if(prev == null || prev == uid)
+					{
+						byName.put(nm,uid);
+					}
+					else
+					{
+						byName.put(nm,"DUP");
+					}
 				}
 			}
 		}
@@ -169,7 +194,11 @@ void schedule.bd_daily_sync()
 			{
 				stopCrm = true;
 			}
-			for each rec in ifnull(recs,List())
+			if(recs == null)
+			{
+				recs = List();
+			}
+			for each rec in recs
 			{
 				scanned = scanned + 1;
 				recId = rec.get("id");
@@ -289,7 +318,12 @@ void schedule.bd_daily_sync()
 					{
 						filename = filename.subString(1);
 					}
-					v.put("url",if(filename != "",bdBaseUrl + "/" + filename,""));
+					profileUrl = "";
+					if(filename != "")
+					{
+						profileUrl = bdBaseUrl + "/" + filename;
+					}
+					v.put("url",profileUrl);
 					planName = "";
 					schema = u.get("subscription_schema");
 					if(schema != null && schema.get("subscription_name") != null)
@@ -333,11 +367,20 @@ void schedule.bd_daily_sync()
 					verified = "";
 					if(u.get("verified") != null)
 					{
-						verified = if(u.get("verified").toString() == "1","YES - Verified","NO - Not Verified");
+						verified = "NO - Not Verified";
+						if(u.get("verified").toString() == "1")
+						{
+							verified = "YES - Verified";
+						}
 					}
 					v.put("verified",verified);
 					signupDigits = ifnull(u.get("signup_date"),"").toString().replaceAll("[^0-9]","");
-					v.put("startDate",if(signupDigits.length() >= 8,signupDigits.subString(0,4) + "-" + signupDigits.subString(4,6) + "-" + signupDigits.subString(6,8),""));
+					startDate = "";
+					if(signupDigits.length() >= 8)
+					{
+						startDate = signupDigits.subString(0,4) + "-" + signupDigits.subString(4,6) + "-" + signupDigits.subString(6,8);
+					}
+					v.put("startDate",startDate);
 					// ---- diff against CRM ----
 					update = Map();
 					for each crmField in fieldMap.keys()
@@ -403,7 +446,12 @@ void schedule.bd_daily_sync()
 	}
 	//
 	// ---------- 3. Summary ----------
-	summary = "BD Daily Sync" + if(dryRun," (DRY RUN)","") + "\nBD members loaded: " + bdById.size() + "\nSingle BD lookups: " + bdSingleCalls + "\n";
+	runLabel = "";
+	if(dryRun)
+	{
+		runLabel = " (DRY RUN)";
+	}
+	summary = "BD Daily Sync" + runLabel + "\nBD members loaded: " + bdById.size() + "\nSingle BD lookups: " + bdSingleCalls + "\n";
 	for each m in stats.keys()
 	{
 		summary = summary + m + ": " + stats.get(m) + "\n";
@@ -424,7 +472,7 @@ void schedule.bd_daily_sync()
 		[
 			from :zoho.adminuserid
 			to :zoho.adminuserid
-			subject :"BD Daily Sync" + if(dryRun," (DRY RUN)","") + " - " + zoho.currentdate
+			subject :"BD Daily Sync" + runLabel + " - " + zoho.currentdate
 			message :body
 		]
 	}
