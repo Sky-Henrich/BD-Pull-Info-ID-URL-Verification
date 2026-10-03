@@ -1,0 +1,431 @@
+/*
+ * BD Daily Sync  (Scheduled Function)
+ * ---------------------------------------------------------------------------
+ * Purpose : Once a day, pull members from Brilliant Directories (igopanama.com),
+ *           match them to Zoho CRM Leads, Contacts, Accounts and Deals, and
+ *           update the CRM record with BD as the source of truth.
+ *           Lead_Source is NEVER updated.
+ *
+ * Matching order (first unique hit wins):
+ *   1. BD_Member_ID stored in CRM
+ *   2. Member ID inside BD_Profile_URL  (https://www.igopanama.com/12207/...)
+ *   3. Email / Secondary Email   (Deals use the linked Contact's email)
+ *   4. Company name              (Lead Company / Account Name)
+ *   5. First + Last name         (Leads and Contacts only)
+ *   Steps 3-5 only match when exactly ONE BD member has that value.
+ *
+ * Fields written (only when BD has a value and it differs from CRM):
+ *   Leads    : BD Member ID, BD Profile URL, Current Plan, Verified Member,
+ *              First/Last Name, Email, Phone, Company, Website, City
+ *   Contacts : BD Member ID, BD Profile URL, Verified Member,
+ *              First/Last Name, Email, Phone, Mailing City
+ *   Accounts : BD Member ID, BD Profile URL, Verified Member,
+ *              Account Name, Phone, Website, Billing City
+ *   Deals    : BD Member ID, BD Profile URL, Current Plan, Verified Member
+ *   Fill-only (never overwritten): Top Category, Subscription Start Date
+ *   When Email changes, the old CRM email is kept in Secondary Email (if empty).
+ *
+ * Setup in Zoho CRM:
+ *   1. Org variable  bd_api_key  = BD API key (already used by
+ *      bd_sync_deal_on_conversion).
+ *   2. Setup > Automation > Schedules > Create Schedule
+ *        Name      : BD Daily Sync
+ *        Function  : Writing Function -> paste this code
+ *        Start     : tomorrow, 7:00 AM (org time zone)
+ *        Frequency : Daily
+ *   3. First run: set dryRun = true, click "Save & Execute", read the log /
+ *      summary email, then set dryRun = false.
+ * ---------------------------------------------------------------------------
+ */
+void schedule.bd_daily_sync()
+{
+	// ======================== CONFIG ========================
+	dryRun = false;
+	// true = log what would change, do not update CRM
+	sendSummaryEmail = true;
+	bdBaseUrl = "https://www.igopanama.com";
+	bdPageSize = 100;
+	// BD pages to pull (100 members each). Raise if BD has more members.
+	bdPages = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50};
+	// CRM pages per module (200 records each, Zoho max 2000 via getRecords)
+	crmPages = {1,2,3,4,5,6,7,8,9,10};
+	// Single-member BD lookups allowed per run (BD default limit = 100 req/min)
+	maxBdSingleCalls = 40;
+	modules = {"Accounts","Contacts","Deals","Leads"};
+	moduleFields = Map();
+	moduleFields.put("Leads",{"BD_Member_ID":"id","BD_Profile_URL":"url","Current_Plan":"plan","Verified_Member":"verified","First_Name":"first","Last_Name":"last","Email":"email","Phone":"phone","Company":"company","Website":"website","City":"city","Top_Category":"pillar"});
+	moduleFields.put("Contacts",{"BD_Member_ID":"id","BD_Profile_URL":"url","Verified_Member":"verified","First_Name":"first","Last_Name":"last","Email":"email","Phone":"phone","Mailing_City":"city","Top_Category":"pillar"});
+	moduleFields.put("Accounts",{"BD_Member_ID":"id","BD_Profile_URL":"url","Verified_Member":"verified","Account_Name":"company","Phone":"phone","Website":"website","Billing_City":"city","Top_Category":"pillar"});
+	moduleFields.put("Deals",{"BD_Member_ID":"id","BD_Profile_URL":"url","Current_Plan":"plan","Verified_Member":"verified","Subscription_Start_Date":"startDate","Top_Category":"pillar"});
+	fillOnlyFields = {"Top_Category","Subscription_Start_Date"};
+	neverUpdate = {"Lead_Source"};
+	pillars = {"Community","Stay","Live","Experience","Relocate","Visit"};
+	// Company values too generic to match on
+	ignoreCompanies = {"independiente","indepediente","independent","self-employed","autonomo","autónomo","personal","no","n/a","na","none","panama","panamá","test","."};
+	// ========================================================
+	apiKey = zoho.crm.getOrgVariable("bd_api_key");
+	headers = Map();
+	headers.put("X-Api-Key",apiKey);
+	//
+	// ---------- 1. Pull BD members and build lookup indexes ----------
+	bdById = Map();
+	byEmail = Map();
+	byCompany = Map();
+	byName = Map();
+	stopPaging = false;
+	for each pg in bdPages
+	{
+		if(stopPaging)
+		{
+			break;
+		}
+		params = Map();
+		params.put("page",pg);
+		params.put("limit",bdPageSize);
+		params.put("output_type","array");
+		resp = invokeurl
+		[
+			url :bdBaseUrl + "/api/v2/user/search"
+			type :POST
+			parameters:params
+			headers:headers
+		];
+		users = List();
+		if(resp.get("status") == "success" && resp.get("message") != null)
+		{
+			users = resp.get("message");
+		}
+		else
+		{
+			info "BD search page " + pg + " returned: " + resp;
+		}
+		if(users.size() == 0)
+		{
+			stopPaging = true;
+		}
+		for each u in users
+		{
+			uid = ifnull(u.get("user_id"),"").toString().trim();
+			if(uid != "")
+			{
+				bdById.put(uid,u);
+				// index keys; a key shared by 2+ members becomes "DUP" and is not used
+				em = ifnull(u.get("email"),"").toString().trim().toLowerCase();
+				if(em != "")
+				{
+					prev = byEmail.get(em);
+					byEmail.put(em,if(prev == null || prev == uid,uid,"DUP"));
+				}
+				co = ifnull(u.get("company"),"").toString().trim().toLowerCase().replaceAll("\\s+"," ");
+				if(co.length() >= 3 && !ignoreCompanies.contains(co))
+				{
+					prev = byCompany.get(co);
+					byCompany.put(co,if(prev == null || prev == uid,uid,"DUP"));
+				}
+				fnm = ifnull(u.get("first_name"),"").toString().trim().toLowerCase();
+				lnm = ifnull(u.get("last_name"),"").toString().trim().toLowerCase();
+				if(fnm != "" && lnm != "")
+				{
+					nm = (fnm + " " + lnm).replaceAll("\\s+"," ");
+					prev = byName.get(nm);
+					byName.put(nm,if(prev == null || prev == uid,uid,"DUP"));
+				}
+			}
+		}
+		totalPages = resp.get("total_pages");
+		if(totalPages != null && pg >= totalPages.toLong())
+		{
+			stopPaging = true;
+		}
+		if(users.size() < bdPageSize)
+		{
+			stopPaging = true;
+		}
+	}
+	info "BD members loaded: " + bdById.size();
+	//
+	// ---------- 2. Walk CRM modules ----------
+	planById = Map();
+	contactEmails = Map();
+	bdSingleCalls = 0;
+	stats = Map();
+	changeLog = List();
+	for each moduleName in modules
+	{
+		fieldMap = moduleFields.get(moduleName);
+		scanned = 0;
+		matched = 0;
+		updated = 0;
+		failed = 0;
+		stopCrm = false;
+		for each cpg in crmPages
+		{
+			if(stopCrm)
+			{
+				break;
+			}
+			recs = zoho.crm.getRecords(moduleName,cpg,200);
+			if(recs == null || recs.size() < 200)
+			{
+				stopCrm = true;
+			}
+			for each rec in ifnull(recs,List())
+			{
+				scanned = scanned + 1;
+				recId = rec.get("id");
+				// ---- collect CRM keys ----
+				crmBdId = ifnull(rec.get("BD_Member_ID"),"").toString().trim();
+				crmUrl = ifnull(rec.get("BD_Profile_URL"),"").toString().trim();
+				emails = List();
+				company = "";
+				fullName = "";
+				if(moduleName == "Leads" || moduleName == "Contacts")
+				{
+					emails.add(ifnull(rec.get("Email"),"").toString().trim().toLowerCase());
+					emails.add(ifnull(rec.get("Secondary_Email"),"").toString().trim().toLowerCase());
+					fullName = (ifnull(rec.get("First_Name"),"").toString().trim() + " " + ifnull(rec.get("Last_Name"),"").toString().trim()).trim().toLowerCase().replaceAll("\\s+"," ");
+				}
+				if(moduleName == "Contacts")
+				{
+					contactEmails.put(recId.toString(),ifnull(rec.get("Email"),"").toString().trim().toLowerCase());
+				}
+				if(moduleName == "Leads")
+				{
+					company = ifnull(rec.get("Company"),"").toString();
+				}
+				else if(moduleName == "Accounts")
+				{
+					company = ifnull(rec.get("Account_Name"),"").toString();
+				}
+				else if(rec.get("Account_Name") != null)
+				{
+					company = ifnull(rec.get("Account_Name").get("name"),"").toString();
+				}
+				if(moduleName == "Deals" && rec.get("Contact_Name") != null)
+				{
+					cid = rec.get("Contact_Name").get("id").toString();
+					emails.add(ifnull(contactEmails.get(cid),""));
+				}
+				company = company.trim().toLowerCase().replaceAll("\\s+"," ");
+				// ---- match ----
+				matchId = "";
+				matchedBy = "";
+				// 1. BD member ID
+				if(crmBdId != "")
+				{
+					if(bdById.get(crmBdId) == null && bdSingleCalls < maxBdSingleCalls)
+					{
+						bdSingleCalls = bdSingleCalls + 1;
+						one = invokeurl
+						[
+							url :bdBaseUrl + "/api/v2/user/get?property=user_id&property_value=" + encodeUrl(crmBdId)
+							type :GET
+							headers:headers
+						];
+						if(one.get("status") == "success" && one.get("message") != null && one.get("message").size() > 0)
+						{
+							bdById.put(crmBdId,one.get("message").get(0));
+						}
+					}
+					if(bdById.get(crmBdId) != null)
+					{
+						matchId = crmBdId;
+						matchedBy = "member ID";
+					}
+				}
+				// 2. member ID inside the profile URL
+				if(matchId == "" && crmUrl.contains("igopanama.com/"))
+				{
+					urlId = ifnull(crmUrl.getSuffix("igopanama.com/"),"");
+					if(urlId.contains("/"))
+					{
+						urlId = urlId.getPrefix("/");
+					}
+					if(urlId.isNumber() && bdById.get(urlId) != null)
+					{
+						matchId = urlId;
+						matchedBy = "profile URL";
+					}
+				}
+				// 3. email
+				if(matchId == "")
+				{
+					for each em in emails
+					{
+						if(matchId == "" && em != "" && byEmail.get(em) != null && byEmail.get(em) != "DUP")
+						{
+							matchId = byEmail.get(em);
+							matchedBy = "email " + em;
+						}
+					}
+				}
+				// 4. company name
+				if(matchId == "" && company.length() >= 3 && !ignoreCompanies.contains(company))
+				{
+					if(byCompany.get(company) != null && byCompany.get(company) != "DUP")
+					{
+						matchId = byCompany.get(company);
+						matchedBy = "company " + company;
+					}
+				}
+				// 5. full name
+				if(matchId == "" && fullName.contains(" "))
+				{
+					if(byName.get(fullName) != null && byName.get(fullName) != "DUP")
+					{
+						matchId = byName.get(fullName);
+						matchedBy = "name " + fullName;
+					}
+				}
+				if(matchId != "")
+				{
+					matched = matched + 1;
+					u = bdById.get(matchId);
+					// ---- normalise BD values ----
+					v = Map();
+					v.put("id",matchId);
+					filename = ifnull(u.get("filename"),"").toString().trim();
+					if(filename.startsWith("/"))
+					{
+						filename = filename.subString(1);
+					}
+					v.put("url",if(filename != "",bdBaseUrl + "/" + filename,""));
+					planName = "";
+					schema = u.get("subscription_schema");
+					if(schema != null && schema.get("subscription_name") != null)
+					{
+						planName = schema.get("subscription_name").toString().trim();
+					}
+					subId = ifnull(u.get("subscription_id"),"").toString();
+					if(planName == "" && subId != "")
+					{
+						if(planById.get(subId) == null)
+						{
+							planResp = invokeurl
+							[
+								url :bdBaseUrl + "/api/v2/subscription_types/get?property=subscription_id&property_value=" + encodeUrl(subId)
+								type :GET
+								headers:headers
+							];
+							pn = "";
+							if(planResp.get("status") == "success" && planResp.get("message") != null && planResp.get("message").size() > 0)
+							{
+								pn = ifnull(planResp.get("message").get(0).get("subscription_name"),"").toString().trim();
+							}
+							planById.put(subId,pn);
+						}
+						planName = planById.get(subId);
+					}
+					v.put("plan",planName);
+					pillar = "";
+					if(planName.contains(" ") && pillars.contains(planName.getPrefix(" ")))
+					{
+						pillar = planName.getPrefix(" ");
+					}
+					v.put("pillar",pillar);
+					v.put("first",ifnull(u.get("first_name"),"").toString().trim());
+					v.put("last",ifnull(u.get("last_name"),"").toString().trim());
+					v.put("email",ifnull(u.get("email"),"").toString().trim());
+					v.put("phone",ifnull(u.get("phone_number"),"").toString().trim());
+					v.put("company",ifnull(u.get("company"),"").toString().trim());
+					v.put("website",ifnull(u.get("website"),"").toString().trim());
+					v.put("city",ifnull(u.get("city"),"").toString().trim());
+					verified = "";
+					if(u.get("verified") != null)
+					{
+						verified = if(u.get("verified").toString() == "1","YES - Verified","NO - Not Verified");
+					}
+					v.put("verified",verified);
+					signupDigits = ifnull(u.get("signup_date"),"").toString().replaceAll("[^0-9]","");
+					v.put("startDate",if(signupDigits.length() >= 8,signupDigits.subString(0,4) + "-" + signupDigits.subString(4,6) + "-" + signupDigits.subString(6,8),""));
+					// ---- diff against CRM ----
+					update = Map();
+					for each crmField in fieldMap.keys()
+					{
+						newVal = ifnull(v.get(fieldMap.get(crmField)),"");
+						if(newVal != "" && !neverUpdate.contains(crmField))
+						{
+							curStr = ifnull(rec.get(crmField),"").toString().trim();
+							same = curStr.toLowerCase() == newVal.toLowerCase();
+							if(crmField == "Phone")
+							{
+								same = curStr.replaceAll("[^0-9]","") == newVal.replaceAll("[^0-9]","");
+							}
+							if(crmField == "Website" || crmField == "BD_Profile_URL")
+							{
+								same = curStr.toLowerCase().removeLastOccurence("/") == newVal.toLowerCase().removeLastOccurence("/") || curStr.toLowerCase() == newVal.toLowerCase();
+							}
+							if(!same && !(fillOnlyFields.contains(crmField) && curStr != ""))
+							{
+								update.put(crmField,newVal);
+							}
+						}
+					}
+					// keep the old email when BD replaces it
+					if(update.containKey("Email"))
+					{
+						oldEmail = ifnull(rec.get("Email"),"").toString().trim();
+						if(oldEmail != "" && ifnull(rec.get("Secondary_Email"),"").toString().trim() == "")
+						{
+							update.put("Secondary_Email",oldEmail);
+						}
+					}
+					if(update.size() > 0)
+					{
+						line = moduleName + " " + recId + " <- BD " + matchId + " (" + matchedBy + "): " + update;
+						if(dryRun)
+						{
+							info "[DRY RUN] " + line;
+							updated = updated + 1;
+							changeLog.add(line);
+						}
+						else
+						{
+							res = zoho.crm.updateRecord(moduleName,recId.toLong(),update);
+							if(res.get("id") != null)
+							{
+								updated = updated + 1;
+								changeLog.add(line);
+							}
+							else
+							{
+								failed = failed + 1;
+								info "FAILED " + line + " -> " + res;
+								changeLog.add("FAILED " + line + " -> " + res);
+							}
+						}
+					}
+				}
+			}
+		}
+		stats.put(moduleName,"scanned " + scanned + ", matched " + matched + ", updated " + updated + ", failed " + failed);
+		info moduleName + ": " + stats.get(moduleName);
+	}
+	//
+	// ---------- 3. Summary ----------
+	summary = "BD Daily Sync" + if(dryRun," (DRY RUN)","") + "\nBD members loaded: " + bdById.size() + "\nSingle BD lookups: " + bdSingleCalls + "\n";
+	for each m in stats.keys()
+	{
+		summary = summary + m + ": " + stats.get(m) + "\n";
+	}
+	info summary;
+	if(sendSummaryEmail)
+	{
+		body = summary.replaceAll("\n","<br>") + "<br><b>Changes</b><br>";
+		if(changeLog.size() == 0)
+		{
+			body = body + "No changes.";
+		}
+		for each c in changeLog
+		{
+			body = body + c + "<br>";
+		}
+		sendmail
+		[
+			from :zoho.adminuserid
+			to :zoho.adminuserid
+			subject :"BD Daily Sync" + if(dryRun," (DRY RUN)","") + " - " + zoho.currentdate
+			message :body
+		]
+	}
+}
