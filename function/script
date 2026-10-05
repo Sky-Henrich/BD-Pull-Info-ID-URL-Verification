@@ -3,7 +3,8 @@
 // Argument mapping in the workflow: leadId -> Leads > Lead Id
 //
 // Looks up the lead's email on Brilliant Directories (igopanama.com) and
-// writes back BD_Member_ID, BD_Profile_URL, Verified_Member, Current_Plan and
+// writes back BD_Member_ID, BD_Profile_URL, Verified_Member, Current_Plan,
+// Company / Website (when empty) and
 // Top_Category / Sub_category / Sub_sub_category (+ the 4 Visit fields).
 //
 // Every exit path logs an "info" line so failures show up in the
@@ -191,6 +192,34 @@ try
 	else
 	{
 		updateMap.put("Verified_Member","NO - Not Verified");
+	}
+	// ---------- Company / Website (only fill when empty in CRM) ----------
+	if(ifnull(leadMap.get("Company"),"").toString().trim() == "")
+	{
+		bdCompany = "";
+		for each  companyKey in {"company","company_name","companyname","company_legal"}
+		{
+			if(bdCompany == "")
+			{
+				bdCompany = ifnull(u.get(companyKey),"").toString().replaceAll("&amp;","&").replaceAll("&#039;","'").trim();
+			}
+		}
+		if(bdCompany != "")
+		{
+			updateMap.put("Company",bdCompany);
+		}
+	}
+	if(ifnull(leadMap.get("Website"),"").toString().trim() == "")
+	{
+		bdWebsite = ifnull(u.get("website"),"").toString().trim();
+		if(bdWebsite != "")
+		{
+			if(!bdWebsite.toLowerCase().startsWith("http"))
+			{
+				bdWebsite = "https://" + bdWebsite;
+			}
+			updateMap.put("Website",bdWebsite);
+		}
 	}
 	// ---------- Top / Sub / Sub-sub categories ----------
 	// Read from the BD user record itself (no extra API calls / permissions needed):
