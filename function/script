@@ -211,8 +211,13 @@ try
 	}
 	if(ifnull(leadMap.get("Website"),"").toString().trim() == "")
 	{
+		// BD stores the website URL-encoded (e.g. https%3A%2F%2Fsite.com)
 		bdWebsite = ifnull(u.get("website"),"").toString().trim();
-		if(bdWebsite != "")
+		if(bdWebsite.contains("%"))
+		{
+			bdWebsite = decodeUrl(bdWebsite).trim();
+		}
+		if(bdWebsite != "" && !bdWebsite.contains(" ") && bdWebsite.contains("."))
 		{
 			if(!bdWebsite.toLowerCase().startsWith("http"))
 			{
@@ -419,6 +424,19 @@ try
 	updateResp = zoho.crm.updateRecord("Leads",leadId,updateMap);
 	info "Update sent: " + updateMap;
 	info "CRM update response: " + updateResp;
+	// If Zoho rejects one field (e.g. invalid website or picklist value),
+	// drop that field and retry once so the other fields still get saved.
+	if(updateResp.get("status") == "error" && updateResp.get("details") != null)
+	{
+		badField = updateResp.get("details").get("api_name");
+		if(badField != null && updateMap.containsKey(badField))
+		{
+			info "Zoho rejected " + badField + " = " + updateMap.get(badField) + " - retrying without it";
+			updateMap.remove(badField);
+			updateResp = zoho.crm.updateRecord("Leads",leadId,updateMap);
+			info "CRM retry response: " + updateResp;
+		}
+	}
 }
 catch (lookupError)
 {
