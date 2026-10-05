@@ -215,7 +215,7 @@ try
 		bdWebsite = ifnull(u.get("website"),"").toString().trim();
 		if(bdWebsite.contains("%"))
 		{
-			bdWebsite = decodeUrl(bdWebsite).trim();
+			bdWebsite = bdWebsite.replaceAll("%3A",":").replaceAll("%3a",":").replaceAll("%2F","/").replaceAll("%2f","/").replaceAll("%3F","?").replaceAll("%3f","?").replaceAll("%3D","=").replaceAll("%3d","=").replaceAll("%26","&").replaceAll("%23","#").replaceAll("%20","").replaceAll("%25","%").trim();
 		}
 		if(bdWebsite != "" && !bdWebsite.contains(" ") && bdWebsite.contains("."))
 		{
