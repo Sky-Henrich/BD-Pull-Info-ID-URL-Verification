@@ -1,0 +1,64 @@
+// schedule.bd_syncImportedLeads
+// Zoho does not run "on create" workflow rules for leads added by CSV import,
+// so this scheduled function catches them instead.
+//
+// Setup > Automation > Schedules > Create Schedule > Function > Write your own
+// Name: bd_syncImportedLeads, run every 1 hour.
+//
+// Every run: looks at the most recently created leads (created today or
+// yesterday) that have an Email but no BD_Member_ID yet, and runs
+// automation.bd_lookupExistingProfile on each of them.
+void schedule.bd_syncImportedLeads()
+{
+today = zoho.currentdate.toString("yyyy-MM-dd");
+yesterday = zoho.currentdate.subDay(1).toString("yyyy-MM-dd");
+processed = 0;
+skipped = 0;
+keepGoing = true;
+// up to 5 pages x 200 = the 1000 newest leads
+for each  pageNo in {1,2,3,4,5}
+{
+	if(keepGoing)
+	{
+		queryMap = Map();
+		queryMap.put("sort_by","Created_Time");
+		queryMap.put("sort_order","desc");
+		leads = zoho.crm.getRecords("Leads",pageNo,200,queryMap);
+		if(leads == null || leads.size() == 0)
+		{
+			keepGoing = false;
+		}
+		else
+		{
+			for each  lead in leads
+			{
+				createdDate = ifnull(lead.get("Created_Time"),"").toString().left(10);
+				if(createdDate != today && createdDate != yesterday)
+				{
+					// sorted newest first, so everything after this is older
+					keepGoing = false;
+				}
+				else
+				{
+					bdId = ifnull(lead.get("BD_Member_ID"),"").toString().trim();
+					email = ifnull(lead.get("Email"),"").toString().trim();
+					if(bdId == "" && email != "")
+					{
+						automation.bd_lookupExistingProfile(lead.get("id").toLong());
+						processed = processed + 1;
+					}
+					else
+					{
+						skipped = skipped + 1;
+					}
+				}
+			}
+			if(leads.size() < 200)
+			{
+				keepGoing = false;
+			}
+		}
+	}
+}
+info "BD sync: looked up " + processed + " lead(s), skipped " + skipped + " (already have BD Member ID or no email)";
+}
