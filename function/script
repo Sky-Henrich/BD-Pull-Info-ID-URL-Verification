@@ -2,7 +2,8 @@
 // Triggered by a Leads workflow rule (on create / import).
 // Argument mapping in the workflow: leadId -> Leads > Lead Id
 //
-// Looks up the lead's email on Brilliant Directories (igopanama.com) and
+// Looks up the lead on Brilliant Directories (igopanama.com) by email, falling
+// back to company name (ignoring capitals), and
 // writes back BD_Member_ID, BD_Profile_URL, Verified_Member, Current_Plan,
 // Company / Website (when empty) and
 // Top_Category / Sub_category / Sub_sub_category (+ the 4 Visit fields).
@@ -29,15 +30,29 @@ if(email == null || email.trim() == "")
 	return;
 }
 normalizedEmail = email.trim().toLowerCase();
+leadCompany = ifnull(leadMap.get("Company"),"").toString().trim();
 try
 {
 	u = null;
 	bdUserId = null;
-	// "get"    = direct lookup by email field (no HTML parsing)
-	// "search" = old method: search, scrape data-token, then user/get/{id}
-	for each  method in {"get","search"}
+	// "get"          = direct lookup by email field (no HTML parsing)
+	// "company"      = fallback: lookup by company name, as typed in CRM
+	// "companyUpper" = same, in CAPITALS (e.g. "HOSTAL BEIRO" in BD)
+	// "search"       = old method: search, scrape data-token, then user/get/{id}
+	// Company matches ignore capitalisation and are only accepted when exactly
+	// one BD member has that company name.
+	for each  method in {"get","company","companyUpper","search"}
 	{
-		if(u == null)
+		skipMethod = false;
+		if(method == "company" && leadCompany == "")
+		{
+			skipMethod = true;
+		}
+		if(method == "companyUpper" && (leadCompany == "" || leadCompany == leadCompany.toUpperCase()))
+		{
+			skipMethod = true;
+		}
+		if(u == null && !skipMethod)
 		{
 			rawMessage = null;
 			if(method == "get")
@@ -45,6 +60,21 @@ try
 				resp = invokeurl
 				[
 					url :bdBase + "/api/v2/user/get?property=email&property_value=" + encodeUrl(normalizedEmail)
+					type :GET
+					headers:headerMap
+					detailed:true
+				];
+			}
+			else if(method == "company" || method == "companyUpper")
+			{
+				companyValue = leadCompany;
+				if(method == "companyUpper")
+				{
+					companyValue = leadCompany.toUpperCase();
+				}
+				resp = invokeurl
+				[
+					url :bdBase + "/api/v2/user/get?property=company&property_value=" + encodeUrl(companyValue)
 					type :GET
 					headers:headerMap
 					detailed:true
@@ -102,6 +132,11 @@ try
 				info "BD rejected the API key (HTTP " + respCode + "). Check the key is active and allowed to use user/get and user/search. Body: " + respText.left(500);
 				return;
 			}
+			if(respCode == 429)
+			{
+				info "BD rate limit hit (HTTP 429) - too many lookups at once. The lead will be picked up by the scheduled sync.";
+				return;
+			}
 			if(respText.startsWith("{"))
 			{
 				respBody = respText.toMap();
@@ -134,24 +169,48 @@ try
 				{
 					candidates.add(rawMessage.toMap());
 				}
-				for each  c in candidates
+				if(method == "company" || method == "companyUpper")
 				{
-					e = c.get("email");
-					if(u == null && e != null && e.toString().trim().toLowerCase() == normalizedEmail)
+					companyMatches = List();
+					for each  c in candidates
 					{
-						u = c;
+						bdCompanyName = ifnull(c.get("company"),"").toString().replaceAll("&amp;","&").replaceAll("&#039;","'").trim();
+						if(bdCompanyName.equalsIgnoreCase(leadCompany))
+						{
+							companyMatches.add(c);
+						}
+					}
+					if(companyMatches.size() == 1)
+					{
+						u = companyMatches.get(0);
+						info "Matched BD member " + u.get("user_id") + " by company name '" + leadCompany + "' (BD email: " + u.get("email") + ")";
+					}
+					else if(companyMatches.size() > 1)
+					{
+						info companyMatches.size() + " BD members share the company name '" + leadCompany + "' - not matching by company to avoid picking the wrong one";
 					}
 				}
-				if(u == null)
+				else
 				{
-					info "BD user/get (" + method + ") returned users but none with email " + normalizedEmail;
+					for each  c in candidates
+					{
+						e = c.get("email");
+						if(u == null && e != null && e.toString().trim().toLowerCase() == normalizedEmail)
+						{
+							u = c;
+						}
+					}
+					if(u == null)
+					{
+						info "BD user/get (" + method + ") returned users but none with email " + normalizedEmail;
+					}
 				}
 			}
 		}
 	}
 	if(u == null)
 	{
-		info "No BD user matched " + normalizedEmail;
+		info "No BD user matched email " + normalizedEmail + " or company '" + leadCompany + "'";
 		return;
 	}
 	updateMap = Map();
